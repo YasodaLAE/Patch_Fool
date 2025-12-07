@@ -7,11 +7,28 @@ import os
 import numpy as np
 import time
 from torchvision.transforms import GaussianBlur
-from utils2 import visualize_attention_map
+
 from models.DeiT import deit_base_patch16_224, deit_tiny_patch16_224, deit_small_patch16_224
 from models.resnet import ResNet50, ResNet152, ResNet101
 from utils import clamp, get_loaders, my_logger, my_meter, PCGrad
 
+
+class MedianBlur(nn.Module):
+    def __init__(self, kernel_size=3):
+        super(MedianBlur, self).__init__()
+        self.kernel_size = kernel_size
+        self.padding = kernel_size // 2
+
+    def forward(self, x):
+        # Pad the input tensor
+        x = F.pad(x, (self.padding, self.padding, self.padding, self.padding), mode='reflect')
+        # Unfold to get sliding windows
+        x = x.unfold(2, self.kernel_size, 1).unfold(3, self.kernel_size, 1)
+        # Reshape to find median
+        x = x.contiguous().view(x.size(0), x.size(1), x.size(2), x.size(3), -1)
+        # Calculate median
+        x = x.median(-1)[0]
+        return x
 
 
 
@@ -126,9 +143,6 @@ def main():
         atten = []
         if 'DeiT' in args.network:
             out, atten = model(X + delta)
-            original_img = X.clone().detach()
-            original_atten = atten # assuming atten is a list of tensors
-            original_result = out.max(1)[1].clone().detach()
         else:
             out = model(X + delta)
 
@@ -345,16 +359,11 @@ def main():
 
         '''Eval Adv Attack'''
         with torch.no_grad():
+            # 1. Generate the Adversarial Image
             if args.sparse_pixel_num == 0 or args.random_sparse_pixel:
                 perturb_x = X + torch.mul(delta, mask)
-                if 'DeiT' in args.network:
-                    out, atten = model(perturb_x)
-                    after_attack_img = perturb_x.clone().detach()
-                    after_attack_atten = atten # The final atten maps
-                    after_attack_result = out.max(1)[1].clone().detach()
-                else:
-                    out = model(perturb_x)
             else:
+                # (Logic for Sparse Patch-Fool if you use it)
                 if train_iter_num < args.learnable_mask_stop:
                     sparse_mask = torch.zeros_like(mask)
                     learnable_mask_temp = learnable_mask.view(learnable_mask.size(0), -1)
@@ -362,32 +371,59 @@ def main():
                     value, _ = learnable_mask_temp.sort(descending=True)
                     threshold = value[:, args.sparse_pixel_num - 1].view(-1, 1)
                     temp_mask[learnable_mask_temp >= threshold] = 1
-
-                print((sparse_mask * mask).view(mask.size(0), -1).sum(-1))
-                print("xxxxxxxxxxxxxxxxxxxxxx")
                 X = original_img * (1 - sparse_mask)
                 perturb_x = X + torch.mul(delta, sparse_mask)
-                if 'DeiT' in args.network:
-                    out, atten = model(perturb_x)
-                    after_attack_img = perturb_x.clone().detach()
-                    after_attack_atten = atten # The final atten maps
-                    after_attack_result = out.max(1)[1].clone().detach()
-                else:
-                    out = model(perturb_x)
 
-            classification_result_after_attack = out.max(1)[1] == y
-            loss = criterion(out, y)
-            meter.add_loss_acc("ADV", {'CE': loss.item()}, (classification_result_after_attack.sum().item()), y.size(0))
+            # ---------------------------------------------------------
+            # EXTENSION: DEFENSE EVALUATION
+            # ---------------------------------------------------------
+
+            # --- Defense 1: Gaussian Blur ---
+            gaussian_defense = GaussianBlur(kernel_size=(5, 5), sigma=(0.1, 2.0))
+            defended_x_gaussian = gaussian_defense(perturb_x)
+
+            # --- Defense 2: Median Blur (Uncomment to use instead) ---
+            median_defense = MedianBlur(kernel_size=3)
+            defended_x_median = median_defense(perturb_x)
+
+            # CHOOSE YOUR DEFENSE HERE (Swap variables to test different ones)
+            final_defended_image = defended_x_gaussian  # or defended_x_median
+            # ---------------------------------------------------------
+
+            # --- REPLACE LINES 353-373 WITH THIS ---
             
-        visualize_attention_map(
-        args,
-        original_atten,             # atten1
-        after_attack_atten,         # atten2
-        original_img,               # image1
-        after_attack_img,           # image2
-        original_result,            # original_result
-        after_attack_result,        # after_attack_result
-        max_patch_index)             # max_patch_index
+            # 2. Run Model on ATTACKED image (No Defense)
+            # We run the model 3 times: No Defense, Gaussian, Median
+            if 'DeiT' in args.network:
+                out_attack, _ = model(perturb_x)
+                out_gauss, _  = model(defended_x_gaussian)
+                out_med, _    = model(defended_x_median)
+            else:
+                out_attack = model(perturb_x)
+                out_gauss  = model(defended_x_gaussian)
+                out_med    = model(defended_x_median)
+
+            # 3. Log results for ALL three
+            
+            # A. Attack (No Defense)
+            loss_attack = criterion(out_attack, y)
+            class_result_attack = out_attack.max(1)[1] == y
+            # (Fix for the variable name error)
+            classification_result_after_attack = class_result_attack 
+            meter.add_loss_acc("ADV_NoDefense", {'CE': loss_attack.item()}, 
+                               class_result_attack.sum().item(), y.size(0))
+
+            # B. Gaussian Defense
+            loss_gauss = criterion(out_gauss, y)
+            class_result_gauss = out_gauss.max(1)[1] == y
+            meter.add_loss_acc("ADV_Gaussian", {'CE': loss_gauss.item()}, 
+                               class_result_gauss.sum().item(), y.size(0))
+
+            # C. Median Defense
+            loss_med = criterion(out_med, y)
+            class_result_med = out_med.max(1)[1] == y
+            meter.add_loss_acc("ADV_Median", {'CE': loss_med.item()}, 
+                               class_result_med.sum().item(), y.size(0))
 
         '''Message'''
         if i % 1 == 0:
